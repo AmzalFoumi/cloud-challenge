@@ -1,0 +1,33 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: cloud-challenge
+  region: us-east-1
+  version: "1.30"
+
+availabilityZones: ["us-east-1a", "us-east-1b"]
+
+managedNodeGroups:
+  - name: workers
+    instanceType: t3.small
+    minSize: 2
+    maxSize: 2
+    desiredCapacity: 2
+    # Spot instances cut node cost ~70% vs on-demand
+    spot: true
+    labels:
+      role: worker
+    tags:
+      project: cloud-challenge
+    iam:
+      withAddonPolicies:
+        # Allows the AWS Load Balancer Controller to create/manage ALBs
+        albIngress: true
+        # Allows nodes to pull images from ECR without extra credentials
+        imageBuilder: true
+
+# OIDC provider is required for IRSA (IAM Roles for Service Accounts).
+# IRSA lets pods assume IAM roles directly instead of using node-level credentials.
+iam:
+  withOIDC: true

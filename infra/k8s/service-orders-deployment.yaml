@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: service-orders
+  namespace: cloud-challenge
+  labels:
+    app: service-orders
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: service-orders
+  template:
+    metadata:
+      labels:
+        app: service-orders
+    spec:
+      containers:
+        - name: service-orders
+          image: <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/cloud-challenge/service-orders:latest
+          ports:
+            - containerPort: 3004
+          env:
+            - name: PORT
+              value: "3004"
+            - name: NODE_ENV
+              value: "production"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3004
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3004
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-orders
+  namespace: cloud-challenge
+spec:
+  selector:
+    app: service-orders
+  ports:
+    - port: 80
+      targetPort: 3004
+  type: ClusterIP

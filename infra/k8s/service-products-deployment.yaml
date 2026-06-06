@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: service-products
+  namespace: cloud-challenge
+  labels:
+    app: service-products
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: service-products
+  template:
+    metadata:
+      labels:
+        app: service-products
+    spec:
+      containers:
+        - name: service-products
+          image: <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/cloud-challenge/service-products:latest
+          ports:
+            - containerPort: 3003
+          env:
+            - name: PORT
+              value: "3003"
+            - name: NODE_ENV
+              value: "production"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3003
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3003
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-products
+  namespace: cloud-challenge
+spec:
+  selector:
+    app: service-products
+  ports:
+    - port: 80
+      targetPort: 3003
+  type: ClusterIP

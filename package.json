@@ -1,0 +1,17 @@
+{
+  "name": "cloud-challenge",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "services/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w apps/frontend\" \"npm run dev -w services/service-hello\" \"npm run dev -w services/service-users\" \"npm run dev -w services/service-products\" \"npm run dev -w services/service-orders\"",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}

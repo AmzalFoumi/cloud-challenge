@@ -1,0 +1,59 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cloud-challenge-ingress
+  namespace: cloud-challenge
+  annotations:
+    # Tells the AWS Load Balancer Controller to create an ALB for this Ingress
+    kubernetes.io/ingress.class: alb
+    # internet-facing = public ALB (use "internal" for private/VPC-only)
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # ip mode routes directly to pod IPs (more efficient than instance mode)
+    alb.ingress.kubernetes.io/target-type: ip
+    # Only listen on HTTP/80 for now; CloudFront handles HTTPS termination
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # Use the existing /health endpoint for ALB target group health checks
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/tags: project=cloud-challenge
+spec:
+  rules:
+    - http:
+        paths:
+          # API routes — each service gets its own path prefix
+          - path: /hello
+            pathType: Prefix
+            backend:
+              service:
+                name: service-hello
+                port:
+                  number: 80
+          - path: /users
+            pathType: Prefix
+            backend:
+              service:
+                name: service-users
+                port:
+                  number: 80
+          - path: /products
+            pathType: Prefix
+            backend:
+              service:
+                name: service-products
+                port:
+                  number: 80
+          - path: /orders
+            pathType: Prefix
+            backend:
+              service:
+                name: service-orders
+                port:
+                  number: 80
+          # Frontend catch-all — must be last
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
