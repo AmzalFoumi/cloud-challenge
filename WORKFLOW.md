@@ -1,7 +1,10 @@
 # Cloud Challenge: AWS + Kubernetes Deployment Workflow
 
 > **Goal**: Deploy the microservices architecture to AWS, matching this flow:
-> `User ↔ TLS ↔ CloudFront (CDN) → ALB (Load Balancer) → EKS → WSO2 Choreo (API Gateway) → Microservices + MySQL`
+> `User ↔ TLS ↔ CloudFront (CDN) → ALB (Load Balancer) → OpenChoreo (API Gateway) → EKS → Microservices + MySQL`
+>
+> **Frontend**: Deployed separately on **Vercel** — not inside EKS.
+> **API Gateway**: OpenChoreo — run locally on k3d first, then move to EKS when ready.
 
 ---
 
@@ -12,7 +15,9 @@
 | AWS region | `us-east-1` |
 | EKS cluster name | `cloud-challenge` |
 | Kubernetes namespace | `cloud-challenge` |
-| Cost while running | ~$0.12/hr (~$2.93/day) |
+| Frontend | Vercel (free tier) |
+| Cost while running (EKS only) | ~$0.12/hr (~$2.93/day) with t3.small |
+| Cost with OpenChoreo on EKS | ~$0.30/hr (~$7.20/day) — needs t3.medium nodes |
 | **Stop cost (run when done)** | `eksctl delete cluster --name cloud-challenge --region us-east-1` |
 
 ---
@@ -91,9 +96,9 @@ Write-Host "Account: $ACCOUNT_ID | Region: $REGION"
 
 ---
 
-## Phase 1 — Dockerize the Services (~1 hr)
+## Phase 1 — Dockerize the Microservices (~45 min)
 
-> **Why this phase?** Kubernetes doesn't run Node.js processes directly — it runs containers. A Dockerfile packages your code and its runtime into a self-contained image. The image is the unit of deployment. All Dockerfiles are already written at `services/*/Dockerfile` and `apps/frontend/Dockerfile`.
+> **Why this phase?** Kubernetes runs containers, not Node.js processes. Dockerfiles for all 4 Express services are already written at `services/*/Dockerfile`. The frontend runs on Vercel — no Dockerfile needed for it.
 
 ### 1.1 Test one service locally
 
@@ -110,19 +115,7 @@ Invoke-WebRequest http://localhost:3001/health | Select-Object -ExpandProperty C
 docker stop test-hello && docker rm test-hello
 ```
 
-### 1.2 Test the frontend locally
-
-```powershell
-docker build -t frontend:test ./apps/frontend
-docker run -d -p 3000:3000 --name test-frontend frontend:test
-
-# Open http://localhost:3000 in your browser
-# Services will show as unreachable (that's expected — no backend running)
-
-docker stop test-frontend && docker rm test-frontend
-```
-
-**What to look for**: Both containers should start without errors. The `/health` endpoints return JSON.
+**What to look for**: Container starts without errors. The `/health` endpoint returns JSON.
 
 ---
 
@@ -136,7 +129,7 @@ docker stop test-frontend && docker rm test-frontend
 $ACCOUNT_ID = $(aws sts get-caller-identity --query Account --output text)
 $REGION = "us-east-1"
 
-$services = @("service-hello", "service-users", "service-products", "service-orders", "frontend")
+$services = @("service-hello", "service-users", "service-products", "service-orders")
 foreach ($svc in $services) {
     aws ecr create-repository `
         --repository-name "cloud-challenge/$svc" `
@@ -166,14 +159,12 @@ docker build -t "${ECR_BASE}/service-hello:latest"    ./services/service-hello
 docker build -t "${ECR_BASE}/service-users:latest"    ./services/service-users
 docker build -t "${ECR_BASE}/service-products:latest" ./services/service-products
 docker build -t "${ECR_BASE}/service-orders:latest"   ./services/service-orders
-docker build -t "${ECR_BASE}/frontend:latest"         ./apps/frontend
 
 # Push all images to ECR
 docker push "${ECR_BASE}/service-hello:latest"
 docker push "${ECR_BASE}/service-users:latest"
 docker push "${ECR_BASE}/service-products:latest"
 docker push "${ECR_BASE}/service-orders:latest"
-docker push "${ECR_BASE}/frontend:latest"
 ```
 
 ### 2.4 Update image names in Kubernetes manifests
@@ -249,9 +240,6 @@ kubectl apply -f infra/k8s/service-hello-deployment.yaml
 kubectl apply -f infra/k8s/service-users-deployment.yaml
 kubectl apply -f infra/k8s/service-products-deployment.yaml
 kubectl apply -f infra/k8s/service-orders-deployment.yaml
-
-# Frontend
-kubectl apply -f infra/k8s/frontend-deployment.yaml
 ```
 
 ### 4.2 Watch pods come up
@@ -264,7 +252,6 @@ kubectl get pods -n cloud-challenge -w
 Expected output (takes ~1–2 minutes):
 ```
 NAME                              READY   STATUS    RESTARTS
-frontend-xxx                      1/1     Running   0
 mysql-0                           1/1     Running   0
 service-hello-xxx                 1/1     Running   0
 service-orders-xxx                1/1     Running   0
@@ -359,7 +346,7 @@ kubectl get ingress -n cloud-challenge
 # ADDRESS column shows something like: k8s-xxx.us-east-1.elb.amazonaws.com
 ```
 
-Save the ALB DNS name — you'll need it for CloudFront:
+Save the ALB DNS name — you'll need it for CloudFront and Choreo:
 ```powershell
 $ALB_DNS = $(kubectl get ingress -n cloud-challenge cloud-challenge-ingress `
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
@@ -380,64 +367,171 @@ All four should return `{"status":"ok","service":"service-xxx"}`.
 
 ---
 
-## Phase 6 — WSO2 Choreo API Gateway (~30 min)
+## Phase 6 — Deploy Frontend to Vercel (~15 min)
 
-> **Why an API Gateway?** Each microservice shouldn't have to implement authentication, rate limiting, and routing independently. The API Gateway is a single entry point that handles all of that. Choreo is WSO2's cloud-native API platform with a free tier — it manages the gateway for you without requiring extra cluster resources.
+> **Why Vercel?** Vercel is the platform built by the Next.js team — it deploys Next.js apps natively with zero config, free tier, automatic HTTPS, and global CDN. Running the frontend inside EKS would waste node resources on something Vercel does better for free.
 >
-> **Architecture fit**: The Choreo gateway acts as the "API Gateway" layer in the system diagram. Traffic flows: CloudFront → Choreo → ALB → EKS pods.
+> The frontend is fully decoupled from EKS. It calls the backend via `NEXT_PUBLIC_API_URL`, which you'll set to the Choreo gateway URL after Phase 7.
 
-### 6.1 Sign up for Choreo
+### 6.1 Push the repo to GitHub (if not already)
 
-1. Go to **choreo.dev** and click "Sign In"
-2. Sign up with your GitHub or Google account (free tier, no credit card)
-3. Create an **Organization** (use your name or "cloud-challenge")
-
-### 6.2 Create a Project
-
-1. Click **Create Project** → name it `cloud-challenge`
-2. Select **Service** as the project type
-
-### 6.3 Add each microservice as a Service Component
-
-For each of the 4 services (repeat these steps 4 times):
-
-1. In your project, click **Create Component** → **Service**
-2. Connect your GitHub repository
-3. Select the service folder: `services/service-hello` (then `service-users`, etc.)
-4. Set the build pack to **NodeJS**
-5. Set the port to `3001` (adjust per service: 3001, 3002, 3003, 3004)
-6. Deploy the component — Choreo builds and hosts it
-
-> **Alternative (simpler)**: Instead of deploying the service code to Choreo, create a **Managed API** in Choreo that proxies to your ALB backend:
-> 1. In Choreo, go to **APIs** → **Create API** → **REST API Proxy**
-> 2. Backend URL: `http://<ALB_DNS>/hello` (paste your ALB DNS from Phase 5)
-> 3. Repeat for each service path
-> 4. Publish the API
-
-### 6.4 Get your Choreo Gateway URL
-
-After publishing:
-1. Go to **Developer Portal** in Choreo
-2. Find your API → copy the **Gateway URL** (looks like `https://your-org.choreo.dev/cloud-challenge/v1`)
-
-### 6.5 Update the frontend deployment
+Vercel connects to your GitHub repo to auto-deploy on every push.
 
 ```powershell
-$CHOREO_URL = "https://your-org.choreo.dev/cloud-challenge/v1"  # paste yours
+# From repo root
+git init
+git add .
+git commit -m "initial commit"
+# Create a repo on github.com, then:
+git remote add origin https://github.com/your-username/cloud-challenge.git
+git push -u origin main
+```
 
-# Update the frontend deployment with the real Choreo URL
-kubectl set env deployment/frontend `
-    -n cloud-challenge `
-    "NEXT_PUBLIC_API_URL=$CHOREO_URL"
+### 6.2 Create a Vercel project
 
-# Restart pods to pick up the new env var
-kubectl rollout restart deployment/frontend -n cloud-challenge
-kubectl rollout status deployment/frontend -n cloud-challenge
+1. Go to **vercel.com** → **Add New Project**
+2. Import your GitHub repository
+3. Under **Root Directory**, click **Edit** and set it to `apps/frontend`
+4. Leave all other settings at defaults (Vercel auto-detects Next.js)
+5. Click **Deploy**
+
+Vercel builds and deploys in ~1 minute. You'll get a URL like `cloud-challenge.vercel.app`.
+
+### 6.3 Add the API URL environment variable (do this after Phase 7)
+
+Once you have your Choreo gateway URL (from Phase 7):
+
+1. In Vercel → your project → **Settings** → **Environment Variables**
+2. Add:
+   - **Name**: `NEXT_PUBLIC_API_URL`
+   - **Value**: `https://your-org.choreo.dev/cloud-challenge/v1` (your Choreo gateway URL)
+   - **Environment**: Production (and Preview if you want)
+3. Go to **Deployments** → click the three dots on the latest deployment → **Redeploy**
+
+After redeployment, the frontend fetches services through Choreo → ALB → EKS pods.
+
+### 6.4 Test the frontend
+
+```powershell
+# Open in browser — services panel should show all 4 services as reachable
+Start-Process "https://cloud-challenge.vercel.app"
 ```
 
 ---
 
-## Phase 7 — CloudFront CDN + TLS (~15 min)
+## Phase 7 — OpenChoreo API Gateway
+
+> **Why an API Gateway?** Each microservice shouldn't have to implement authentication, rate limiting, and routing independently. The API Gateway is a single entry point that handles all of that.
+>
+> **OpenChoreo** is WSO2's open-source Internal Developer Platform — it includes a full API gateway (kgateway/Envoy), a developer portal (Backstage), observability, and CI/CD. It runs inside your Kubernetes cluster.
+>
+> **Strategy**: Learn OpenChoreo locally on k3d first. When comfortable, install the same Helm charts on EKS.
+
+### 7.1 Local OpenChoreo (do this before EKS)
+
+The local setup is documented separately — follow the **"Local OpenChoreo Setup"** explanation (shared alongside this workflow). It walks through:
+- Installing k3d
+- Creating the OpenChoreo k3d cluster
+- Installing all dependencies (cert-manager, kgateway, thunder, etc.)
+- Installing OpenChoreo control plane + data plane
+
+Once local is working, you'll have hands-on familiarity before touching AWS.
+
+### 7.2 OpenChoreo on EKS (when you're ready)
+
+> **Node size change required**: OpenChoreo needs ~4 GB RAM per node. Before running this phase, update `infra/eks/cluster.yaml` to use `t3.medium` instead of `t3.small`.
+
+```yaml
+# infra/eks/cluster.yaml — change this line:
+instanceType: t3.medium   # was t3.small
+```
+
+Recreate the cluster if it already exists:
+```powershell
+eksctl delete cluster --name cloud-challenge --region us-east-1
+# Edit infra/eks/cluster.yaml, then:
+eksctl create cluster -f infra/eks/cluster.yaml
+```
+
+Clone the OpenChoreo repo on your machine (contains the Helm charts):
+```powershell
+git clone https://github.com/openchoreo/openchoreo.git
+cd openchoreo
+```
+
+Install in the same dependency order as local — the commands are identical, but they run against your EKS kubeconfig (which eksctl already configured):
+
+```bash
+# Gateway API CRDs
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml
+
+# cert-manager
+helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --version v1.19.2 --set crds.enabled=true
+
+# external-secrets
+helm upgrade --install external-secrets oci://ghcr.io/external-secrets/charts/external-secrets \
+  --namespace external-secrets --create-namespace \
+  --version 1.3.2 --set installCRDs=true
+
+# kgateway
+helm upgrade --install kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds \
+  --create-namespace --namespace openchoreo-control-plane --version v2.2.1
+
+helm upgrade --install kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway \
+  --namespace openchoreo-control-plane --create-namespace --version v2.2.1 \
+  --set controller.extraEnv.KGW_ENABLE_GATEWAY_API_EXPERIMENTAL_FEATURES=true
+
+# thunder (auth layer)
+helm upgrade --install thunder oci://ghcr.io/asgardeo/helm-charts/thunder \
+  --namespace openchoreo-control-plane --create-namespace \
+  --version 0.23.0 --values install/k3d/common/values-thunder.yaml
+
+# backstage secrets
+kubectl create secret generic backstage-secrets -n openchoreo-control-plane \
+  --from-literal=backend-secret="<any-random-32-char-string>" \
+  --from-literal=client-secret="backstage-portal-secret" \
+  --from-literal=jenkins-api-key="placeholder-not-in-use"
+
+# OpenChoreo control plane + data plane
+# Note: use EKS-specific values files if available; otherwise start with k3d values
+# and adjust — check https://github.com/openchoreo/openchoreo for EKS examples
+helm upgrade --install openchoreo-control-plane install/helm/openchoreo-control-plane \
+  --namespace openchoreo-control-plane --create-namespace \
+  --values install/k3d/single-cluster/values-cp.yaml
+
+helm upgrade --install openchoreo-data-plane install/helm/openchoreo-data-plane \
+  --dependency-update \
+  --namespace openchoreo-data-plane --create-namespace \
+  --values install/k3d/single-cluster/values-dp.yaml
+```
+
+### 7.3 Register your services with OpenChoreo
+
+Once OpenChoreo is running, define each microservice as a Component. OpenChoreo will create the API routes, apply auth/rate-limiting, and expose a managed gateway URL.
+
+```bash
+# Verify all OpenChoreo pods are running first
+kubectl get pods -n openchoreo-control-plane
+kubectl get pods -n openchoreo-data-plane
+```
+
+Access the developer portal (on EKS, use `kubectl port-forward`):
+```bash
+kubectl port-forward svc/openchoreo-control-plane -n openchoreo-control-plane 8080:8080
+# Open http://localhost:8080 — login: admin@openchoreo.dev / Admin@123
+```
+
+### 7.4 Get the OpenChoreo Gateway URL
+
+After registering services, OpenChoreo exposes a gateway endpoint. Copy it — you'll need it for Vercel (`NEXT_PUBLIC_API_URL`) and CloudFront origin.
+
+**Go back to Phase 6.3** and set `NEXT_PUBLIC_API_URL` to your OpenChoreo gateway URL in Vercel.
+
+---
+
+## Phase 8 — CloudFront CDN + TLS (~15 min)
 
 > **Why CloudFront?** CloudFront is AWS's CDN. It caches content at ~450 edge locations worldwide so users get responses from a server close to them. It also provides free HTTPS via a `*.cloudfront.net` certificate — this gives you TLS Hop 1 without managing any certs yourself.
 >
@@ -450,7 +544,7 @@ kubectl rollout status deployment/frontend -n cloud-challenge
 >
 > The CDN is not a transparent pipe — it ends one encrypted session and starts another. That's why the architecture diagram shows **two locks**.
 
-### 7.1 Create a CloudFront distribution (AWS Console)
+### 8.1 Create a CloudFront distribution (AWS Console)
 
 1. Go to **AWS Console → CloudFront → Create distribution**
 2. **Origin domain**: paste your ALB DNS (from Phase 5, `$ALB_DNS`)
@@ -466,17 +560,14 @@ kubectl rollout status deployment/frontend -n cloud-challenge
 
 Wait ~10 minutes for the distribution to deploy (Status changes from "Deploying" to "Enabled").
 
-### 7.2 Get your CloudFront URL
+### 8.2 Get your CloudFront URL
 
 On the distribution detail page, copy the **Distribution domain name**: `xyz.cloudfront.net`
 
-### 7.3 Test the full stack
+### 8.3 Test the API layer through CloudFront
 
 ```powershell
 $CF = "https://xyz.cloudfront.net"  # paste your CloudFront domain
-
-# Frontend
-Invoke-WebRequest $CF | Select-Object StatusCode
 
 # Services through the full stack: User → HTTPS → CloudFront → HTTP → ALB → EKS
 Invoke-WebRequest "$CF/hello/health"    | Select-Object -ExpandProperty Content
@@ -492,27 +583,28 @@ Invoke-WebRequest "$CF/hello/hello" -UseBasicParsing | Select-Object -ExpandProp
 
 ---
 
-## Phase 8 — End-to-End Architecture Verification
+## Phase 9 — End-to-End Architecture Verification
 
 The full request flow is now:
 
 ```
-Browser (HTTPS)
-    │ TLS 1 — *.cloudfront.net certificate
-    ▼
-CloudFront Edge
-    │ HTTP (TLS 2 omitted — traffic stays inside AWS network)
-    ▼
-ALB (xyz.us-east-1.elb.amazonaws.com)
-    │ path-based routing (/hello → service-hello, /users → service-users, etc.)
-    ▼
-EKS Ingress → Kubernetes ClusterIP Services
-    │ (optionally via Choreo API Gateway for auth/rate-limiting)
-    ▼
-Pods: service-hello × 2, service-users × 2, service-products × 2, service-orders × 2
-                                    │
-                                    ▼
-                            MySQL StatefulSet (EBS volume)
+Browser (HTTPS) → Vercel (frontend CDN)
+                       │
+                       │ NEXT_PUBLIC_API_URL (API calls only)
+                       ▼
+Browser → HTTPS → CloudFront Edge
+                       │ HTTP (stays inside AWS network)
+                       ▼
+              ALB (xyz.us-east-1.elb.amazonaws.com)
+                       │ path-based routing
+                       ▼
+              EKS Ingress → Kubernetes ClusterIP Services
+                       │
+                       ▼
+  Pods: service-hello × 2, service-users × 2, service-products × 2, service-orders × 2
+                       │
+                       ▼
+               MySQL StatefulSet (EBS volume)
 ```
 
 ### Verification checklist
@@ -530,24 +622,22 @@ Invoke-WebRequest "https://xyz.cloudfront.net/hello/hello" | Select-Object -Expa
 # 4. CloudFront headers present (proves CDN is in the path)
 (Invoke-WebRequest "https://xyz.cloudfront.net/hello/hello" -UseBasicParsing).Headers["x-cache"]
 
-# 5. Frontend loads
-Start-Process "https://xyz.cloudfront.net"
+# 5. Frontend loads on Vercel and shows services as reachable
+Start-Process "https://cloud-challenge.vercel.app"
 ```
 
 ---
 
-## Phase 9 — Cleanup (run at the end of every session)
+## Phase 10 — Cleanup (run at the end of every session)
 
-> **Important**: EKS costs $0.10/hr even with no traffic. Always delete the cluster when you're done for the day.
+> **Important**: EKS costs $0.10/hr even with no traffic. Always delete the cluster when you're done for the day. Vercel and Choreo free tiers cost nothing — leave those running.
 
 ```powershell
 # Step 1: Disable and delete the CloudFront distribution
-# (Console: CloudFront → select distribution → Disable → wait → Delete)
+# Console: CloudFront → select distribution → Disable → wait → Delete
 # Or via CLI:
 $DIST_ID = $(aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='cloud-challenge'].Id" --output text)
-$ETAG    = $(aws cloudfront get-distribution-config --id $DIST_ID --query ETag --output text)
-# Disable first (distribution must be disabled before deletion)
-# This requires fetching the full config and setting Enabled=false — use the Console for simplicity
+# Disable first (distribution must be disabled before deletion) — use the Console for simplicity
 
 # Step 2: Delete the EKS cluster (also deletes VPC, nodes, ALB, EBS volumes)
 eksctl delete cluster --name cloud-challenge --region us-east-1
@@ -559,7 +649,7 @@ aws eks list-clusters --region us-east-1
 aws elbv2 describe-load-balancers --region us-east-1 --query "LoadBalancers[].DNSName"
 
 # Step 4 (optional): Delete ECR repos to avoid any storage cost
-$services = @("service-hello", "service-users", "service-products", "service-orders", "frontend")
+$services = @("service-hello", "service-users", "service-products", "service-orders")
 foreach ($svc in $services) {
     aws ecr delete-repository --repository-name "cloud-challenge/$svc" --force --region us-east-1
 }
@@ -581,7 +671,9 @@ eksctl create cluster -f infra/eks/cluster.yaml
 # 4. Re-apply all manifests
 kubectl apply -f infra/k8s/
 
-# 5. Re-create CloudFront distribution (Phase 7)
+# 5. Re-create CloudFront distribution (Phase 8)
+
+# 6. Vercel stays deployed — no action needed
 ```
 
 ---
@@ -591,43 +683,45 @@ kubectl apply -f infra/k8s/
 | Component | Rate | Notes |
 |-----------|------|-------|
 | EKS control plane | $0.10/hr | Charged from create to delete |
-| 2× t3.small (spot) | ~$0.009/hr total | ~70% saving vs on-demand |
+| 2× t3.small (spot) | ~$0.009/hr total | Before OpenChoreo on EKS |
+| 2× t3.medium (spot) | ~$0.034/hr total | Required when OpenChoreo runs on EKS |
 | ALB | ~$0.008/hr + LCU | Minimal for learning traffic |
 | EBS (MySQL 5GB gp2) | ~$0.50/month | Deleted when cluster is deleted |
 | ECR storage | ~$0/month | 500MB free tier |
 | CloudFront | ~$0/month | 1TB/month + 10M requests free |
-| **Total while running** | **~$0.12/hr** | **~$2.93/day** |
-
-With self-hosted WSO2 APIM (t3.medium nodes instead): add ~$1.34/day.
+| Vercel | $0 | Free tier |
+| OpenChoreo (local k3d) | $0 | Runs on your machine |
+| **Total — microservices only (t3.small)** | **~$0.12/hr** | **~$2.93/day** |
+| **Total — with OpenChoreo on EKS (t3.medium)** | **~$0.31/hr** | **~$7.44/day** |
 
 ---
 
-## Appendix B — Self-Hosted WSO2 API Manager (Advanced)
+## Appendix B — OpenChoreo Component Model (Replacing Raw kubectl Manifests)
 
-If you want WSO2 running inside the cluster instead of Choreo SaaS, you need larger nodes. Recreate the cluster with `t3.medium` by editing `infra/eks/cluster.yaml`:
+OpenChoreo can go further than just API gateway — it can manage your microservice deployments too, replacing the raw `kubectl apply` manifests in Phase 4. This is what "using OpenChoreo for the K8s stuff" means.
+
+Instead of Deployment + Service YAMLs, you define a **Component** in OpenChoreo:
 
 ```yaml
-instanceType: t3.medium   # was t3.small — 4GB RAM needed for WSO2 APIM
+apiVersion: core.choreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: service-hello
+  namespace: default
+spec:
+  type: Service
+  source:
+    containerRegistry:
+      image: <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/cloud-challenge/service-hello:latest
+  endpoints:
+    - name: http
+      port: 3001
+      type: REST
 ```
 
-Then install WSO2 API Manager via Helm:
+OpenChoreo then handles scheduling, routing, and exposing the service through the gateway — you don't write Deployment or Service YAMLs manually.
 
-```powershell
-helm repo add wso2 https://helm.wso2.com
-helm repo update
-
-helm install wso2am wso2/wso2am-single-node `
-    --namespace cloud-challenge `
-    --set wso2.apim.resources.requests.memory="2Gi" `
-    --set wso2.apim.resources.requests.cpu="1000m" `
-    --set wso2.apim.resources.limits.memory="3Gi" `
-    --set wso2.apim.resources.limits.cpu="2000m"
-
-kubectl get pods -n cloud-challenge -w
-# WSO2 APIM takes 3-5 minutes to start
-```
-
-Once running, WSO2 APIM exposes a Publisher UI (`https://<node-ip>:9443/publisher`) and a Gateway at port `8243`. You'd update the Ingress to route API traffic through APIM instead of directly to services.
+**When to switch**: After you're comfortable with OpenChoreo locally and have deployed at least one service through its UI. The raw manifests in `infra/k8s/` remain as a fallback if you want direct kubectl control.
 
 ---
 
@@ -640,6 +734,8 @@ Once running, WSO2 APIM exposes a Publisher UI (`https://<node-ip>:9443/publishe
 | ALB not created | `kubectl describe ingress -n cloud-challenge` | ALB controller not installed or IAM policy missing |
 | 504 from CloudFront | Check ALB target group health | Pod not passing health check |
 | `exec /bin/sh: exec format error` | Check Docker build platform | Build for linux/amd64: `docker build --platform linux/amd64` |
+| Vercel build fails | Check Vercel build logs | Ensure root directory is set to `apps/frontend` |
+| Frontend shows services unreachable | Check `NEXT_PUBLIC_API_URL` in Vercel env vars | Must point to OpenChoreo gateway URL, then redeploy |
 
 ```powershell
 # Useful debugging commands

@@ -49,11 +49,3 @@ spec:
                 name: service-orders
                 port:
                   number: 80
-          # Frontend catch-all — must be last
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: frontend
-                port:
-                  number: 80
